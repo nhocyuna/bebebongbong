@@ -5,6 +5,19 @@ const rand=(a,b)=>a+Math.random()*(b-a);
 const choose=a=>a[Math.floor(Math.random()*a.length)];
 const effectNames=['glow','spark','mist','prism','shimmer','rain'];
 
+function saveMosaic(){
+  if(!images.length)return;
+  const out=document.createElement('canvas'),oc=out.getContext('2d');
+  const cols=Math.ceil(Math.sqrt(images.length)),rows=Math.ceil(images.length/cols),cell=260;
+  out.width=cols*cell;out.height=rows*cell;
+  oc.fillStyle='#e9e1d5';oc.fillRect(0,0,out.width,out.height);
+  images.forEach((im,i)=>{const x=(i%cols)*cell,y=Math.floor(i/cols)*cell,pad=7;
+    const scale=Math.min((cell-pad*2)/im.width,(cell-pad*2)/im.height),w=im.width*scale,h=im.height*scale;
+    oc.save();oc.filter='blur(9px) saturate(.72)';oc.globalAlpha=.9;oc.drawImage(im,x+(cell-w)/2,y+(cell-h)/2,w,h);oc.restore();
+  });
+  const link=document.createElement('a');link.download='memory-plus-mosaic.png';link.href=out.toDataURL('image/png');link.click();
+}
+
 function makeSoft(im){
   const max=innerWidth<600?240:360;
   const scale=Math.min(max/im.width,max/im.height);
@@ -180,6 +193,7 @@ c.addEventListener('click',event=>{
     card.clickEnd=performance.now()+5200;card.focusEnd=0;card.effect=choose(effectNames);cards.splice(i,1);cards.push(card);break;
   }}
 });
+document.getElementById('saveImage')?.addEventListener('click',saveMosaic);
 document.addEventListener('contextmenu',event=>event.preventDefault());
 document.addEventListener('dragstart',event=>event.preventDefault());
 addEventListener('resize',resize);resize();requestAnimationFrame(frame);loadAssets();
