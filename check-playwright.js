@@ -1,0 +1,2 @@
+const { chromium } = require('playwright');
+(async()=>{const b=await chromium.launch({headless:true,channel:'msedge'});const p=await b.newPage({viewport:{width:1280,height:800}});p.on('console',m=>console.log('CONSOLE',m.type(),m.text()));p.on('pageerror',e=>console.log('PAGEERROR',e.message));await p.goto('file:///D:/Vibe%20Test%20Originals/index.html');await p.waitForTimeout(3000);await p.screenshot({path:'web-check.png',fullPage:true});console.log('title',await p.title());await b.close()})().catch(e=>{console.error(e);process.exit(1)})
