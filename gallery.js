@@ -34,10 +34,11 @@ function newCard(im){
 }
 function arrange(){
   if(!images.length)return;
-  const target=Math.max(10,Math.min(W<600?24:36,Math.round(W*H/(W<600?26000:32000))));
   cards.length=0;
   const shuffled=[...images].sort(()=>Math.random()-.5);
-  for(let i=0;i<target;i++)cards.push(newCard(shuffled[i%shuffled.length]));
+  // Render every loaded image exactly once. Movement only changes positions;
+  // it never swaps the image content on a card.
+  for(const image of shuffled)cards.push(newCard(image));
 }
 function resize(){
   W=innerWidth;H=innerHeight;D=Math.min(devicePixelRatio||1,W<600?1:1.5);
@@ -79,9 +80,25 @@ function drawCard(card,now){
   const progress=active?(now-card.focusStart)/(card.focusEnd-card.focusStart):0;
   const clarity=active?Math.pow(Math.sin(Math.PI*Math.min(1,Math.max(0,progress))),.65):0;
   const clicked=now<card.clickEnd;
-  const clickProgress=clicked?1-(card.clickEnd-now)/2400:0;
-  const clickClarity=clicked?Math.min(1,Math.max(0,(clickProgress-.08)/.48))*Math.min(1,Math.max(0,(1-clickProgress)/.2)):0;
-  const clickZoom=clicked?1+1.1*Math.sin(Math.PI*Math.max(0,Math.min(1,clickProgress))):1;
+  // A selected photo should take its time becoming clear, then fade back out
+  // immediately after reaching full clarity. Keep both phases smooth so the
+  // change does not feel like a sudden flash.
+  const clickProgress=clicked?1-(card.clickEnd-now)/5200:0;
+  const clickClarity=clicked
+    ? clickProgress<.56
+      ? (clickProgress/.56)*(clickProgress/.56)*(3-2*(clickProgress/.56))
+      : (()=>{const t=Math.min(1,Math.max(0,(clickProgress-.56)/.44));return 1-(t*t*(3-2*t));})()
+    : 0;
+  const clickZoom=clicked
+    ? (()=>{
+        const p=Math.max(0,Math.min(1,clickProgress));
+        const wave=Math.sin(Math.PI*p);
+        // Scale the selected card until it covers the viewport, regardless
+        // of the card's original aspect ratio, then return it smoothly.
+        const coverScale=Math.max(1.05,W/card.w,H/card.h)*1.08;
+        return 1+(coverScale-1)*wave*wave;
+      })()
+    : 1;
   const scale=(1+clarity*.13)*clickZoom;
   const angle=card.a+Math.sin(now*.00028+card.phase)*.055+gust*.045;
   card.drawX=x;card.drawY=y;card.drawScale=scale;
@@ -113,7 +130,6 @@ function move(now){
   const x=first.tx,y=first.ty;first.tx=second.tx;first.ty=second.ty;second.tx=x;second.ty=y;
   for(const card of [first,second]){
     card.ta=rand(-.52,.52);
-    if(Math.random()<.25){card.im=choose(images);const size=sizeFor(card.im);card.w=size.w;card.h=size.h}
     const i=cards.indexOf(card);cards.splice(i,1);
     if(card===first)cards.push(card);else cards.unshift(card);
   }
@@ -124,7 +140,9 @@ function frame(now){
   lastFrame=now;ctx.clearRect(0,0,W,H);
   if(now>nextPulse){pulse(now);nextPulse=now+rand(650,1150)}
   if(now>nextMove){move(now);nextMove=now+rand(1500,2600)}
-  for(const card of cards)drawCard(card,now);
+  // Keep the selected photo above every other card for the whole effect.
+  const orderedCards=[...cards].sort((a,b)=>(now<a.clickEnd?1:0)-(now<b.clickEnd?1:0));
+  for(const card of orderedCards)drawCard(card,now);
 }
 async function decodePayload(base64,key){
   const bytes=Uint8Array.from(atob(base64),ch=>ch.charCodeAt(0));
@@ -151,13 +169,15 @@ async function loadAssets(){
     }catch(e){console.warn('Ảnh lỗi',i,e)}
   }}
   await Promise.all(Array.from({length:Math.min(8,encryptedAssets.length)},worker));
-  if(images.length&&!cards.length)arrange();
+  // Rebuild once more after all files are loaded so the final gallery contains
+  // every Data image exactly once, including images loaded after the first five.
+  if(images.length)arrange();
 }
 
 c.addEventListener('click',event=>{
   const x=event.clientX,y=event.clientY;
   for(let i=cards.length-1;i>=0;i--){const card=cards[i];if(Math.abs(x-card.drawX)<card.w*card.drawScale/2+8&&Math.abs(y-card.drawY)<card.h*card.drawScale/2+8){
-    card.clickEnd=performance.now()+2400;card.focusEnd=0;card.effect=choose(effectNames);cards.splice(i,1);cards.push(card);break;
+    card.clickEnd=performance.now()+5200;card.focusEnd=0;card.effect=choose(effectNames);cards.splice(i,1);cards.push(card);break;
   }}
 });
 document.addEventListener('contextmenu',event=>event.preventDefault());
