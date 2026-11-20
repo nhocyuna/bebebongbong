@@ -65,3 +65,12 @@ async function openCard(item){
 document.getElementById('prevPage').onclick=()=>{page--;render()};
 document.getElementById('nextPage').onclick=()=>{page++;render()};
 addEventListener('resize',render);refresh();setInterval(()=>{if(!busy)refresh()},30000);
+const music=document.getElementById('backgroundMusic');
+const musicToggle=document.getElementById('musicToggle');
+music.volume=.42;
+musicToggle.onclick=async()=>{
+  if(music.paused){
+    try{await music.play();musicToggle.textContent='♫ Tắt nhạc';musicToggle.setAttribute('aria-label','Tắt nhạc')}
+    catch(error){notify('Chạm lại để phát nhạc trên điện thoại.')}
+  }else{music.pause();musicToggle.textContent='♫ Bật nhạc';musicToggle.setAttribute('aria-label','Phát nhạc')}
+};

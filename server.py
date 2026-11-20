@@ -6,19 +6,21 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import hashlib, hmac, json, mimetypes, os, secrets, sqlite3
+import re
 
 ROOT = Path(__file__).resolve().parent
-DATA = Path(r'C:\Users\nhocy\OneDrive\Desktop\Bằng\HH\all')
+DATA = Path(os.environ.get('MEMORY_DATA_DIR', r'C:\Users\nhocy\OneDrive\Desktop\Bằng\HH\all'))
 VAULT = DATA / '_sealed'
-CATALOG = ROOT / 'secure-catalog.json'
-KEY_FILE = ROOT / 'vault-key.bin'
-ADMIN_FILE = ROOT / 'admin-key.txt'
-DB = Path(os.environ.get('MEMORY_DB', str(ROOT / 'secure-game.sqlite3')))
+CATALOG = Path(os.environ.get('MEMORY_CATALOG_FILE', str(ROOT / 'secure-catalog.json')))
+KEY_FILE = Path(os.environ.get('MEMORY_KEY_FILE', str(ROOT / 'vault-key.bin')))
+ADMIN_FILE = Path(os.environ.get('MEMORY_ADMIN_FILE', str(ROOT / 'admin-key.txt')))
+STATE_DIR = Path(os.environ.get('MEMORY_STATE_DIR', str(ROOT)))
+DB = Path(os.environ.get('MEMORY_DB', str(STATE_DIR / 'secure-game.sqlite3')))
 TZ = ZoneInfo('Asia/Ho_Chi_Minh')
 LIMIT = 300
 VISITOR_LIMIT = 189
 HOST = os.environ.get('MEMORY_HOST', '127.0.0.1')
-PORT = int(os.environ.get('MEMORY_PORT', '8765'))
+PORT = int(os.environ.get('PORT', os.environ.get('MEMORY_PORT', '8765')))
 
 def db_open():
     db = sqlite3.connect(DB, timeout=20, isolation_level=None)
@@ -26,6 +28,9 @@ def db_open():
     return db
 
 def initialize():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not CATALOG.is_file() or not KEY_FILE.is_file() or not VAULT.is_dir():
+        raise RuntimeError('Missing encrypted media package or decryption key')
     with db_open() as db:
         db.execute('PRAGMA journal_mode=WAL')
         db.execute('CREATE TABLE IF NOT EXISTS spent(id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, ip TEXT NOT NULL)')
@@ -80,7 +85,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob:; media-src blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'")
         for key,value in (extra or {}).items(): self.send_header(key,value)
         self.end_headers()
         try: self.wfile.write(data)
@@ -93,6 +98,19 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b'{}')
     def do_GET(self):
         path = urlsplit(self.path).path; ip = self.ip(); agent = self.headers.get('User-Agent','')
+        if path == '/music.mp3':
+            source=ROOT/'Data'/'Music.mp3'
+            if not source.is_file(): self.json(404,{'error':'missing_music'}); return
+            raw=source.read_bytes(); size=len(raw)
+            match=re.fullmatch(r'bytes=(\d*)-(\d*)',self.headers.get('Range','')) if self.headers.get('Range') else None
+            if match:
+                start=int(match.group(1)) if match.group(1) else max(0,size-int(match.group(2)))
+                end=int(match.group(2)) if match.group(2) and match.group(1) else size-1
+                if start>=size or end<start: self.json(416,{'error':'range'}); return
+                end=min(end,size-1)
+                self.send_bytes(206,raw[start:end+1],'audio/mpeg',{'Accept-Ranges':'bytes','Content-Range':f'bytes {start}-{end}/{size}'})
+            else: self.send_bytes(200,raw,'audio/mpeg',{'Accept-Ranges':'bytes'})
+            log(ip,'GET',path,agent,'music'); return
         if path == '/api/status':
             with db_open() as db:
                 response = snapshot(db,ip)
