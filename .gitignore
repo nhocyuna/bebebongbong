@@ -4,6 +4,7 @@ vault-key.bin
 secure-game.sqlite3*
 secure-test.sqlite3*
 registration-test.sqlite3*
+limit-test.sqlite3*
 secure-catalog.json
 previews/
 memory-state.sqlite3

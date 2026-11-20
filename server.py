@@ -6,7 +6,6 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import hashlib, hmac, json, mimetypes, os, secrets, sqlite3
-import re
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(r'C:\Users\nhocy\OneDrive\Desktop\Bằng\HH\all')
@@ -14,11 +13,10 @@ VAULT = DATA / '_sealed'
 CATALOG = ROOT / 'secure-catalog.json'
 KEY_FILE = ROOT / 'vault-key.bin'
 ADMIN_FILE = ROOT / 'admin-key.txt'
-VIEW_FILE = ROOT / 'viewer-key.txt'
-SPECIAL_VIEW_PASSWORD = 'h'
 DB = Path(os.environ.get('MEMORY_DB', str(ROOT / 'secure-game.sqlite3')))
 TZ = ZoneInfo('Asia/Ho_Chi_Minh')
 LIMIT = 300
+VISITOR_LIMIT = 189
 HOST = os.environ.get('MEMORY_HOST', '127.0.0.1')
 PORT = int(os.environ.get('MEMORY_PORT', '8765'))
 
@@ -28,15 +26,22 @@ def db_open():
     return db
 
 def initialize():
-    if not VIEW_FILE.exists(): VIEW_FILE.write_text(secrets.token_urlsafe(18), encoding='utf-8')
     with db_open() as db:
         db.execute('PRAGMA journal_mode=WAL')
         db.execute('CREATE TABLE IF NOT EXISTS spent(id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, ip TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS attempts(day TEXT PRIMARY KEY, count INTEGER NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS visitor_attempts(day TEXT NOT NULL, ip TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(day,ip))')
         db.execute('CREATE TABLE IF NOT EXISTS access_log(id INTEGER PRIMARY KEY, at TEXT NOT NULL, ip TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, agent TEXT NOT NULL, outcome TEXT NOT NULL)')
-        db.execute('CREATE TABLE IF NOT EXISTS failures(ip TEXT NOT NULL, at TEXT NOT NULL)')
-        db.execute('CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, ip TEXT NOT NULL, expires TEXT NOT NULL)')
-        db.execute('CREATE TABLE IF NOT EXISTS viewers(name TEXT PRIMARY KEY, salt BLOB NOT NULL, password_hash BLOB NOT NULL, created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        current_day=day_key()
+        if not db.execute("SELECT 1 FROM settings WHERE key='visitor_limit_migrated'").fetchone():
+            counts={}
+            for at,ip in db.execute("SELECT at,ip FROM access_log WHERE path='/api/open' AND outcome IN ('miss','opened')"):
+                if (datetime.fromisoformat(at)-timedelta(hours=7)).date().isoformat()==current_day:
+                    counts[ip]=counts.get(ip,0)+1
+            for ip,count in counts.items():
+                db.execute('INSERT INTO visitor_attempts(day,ip,count) VALUES (?,?,?)',(current_day,ip,count))
+            db.execute("INSERT INTO settings(key,value) VALUES ('visitor_limit_migrated','1')")
 
 def catalog(): return json.loads(CATALOG.read_text(encoding='utf-8'))
 def now(): return datetime.now(TZ)
@@ -46,29 +51,16 @@ def check_password(supplied, file):
     expected = file.read_text(encoding='utf-8').strip() if file.exists() else ''
     return bool(supplied and expected and hmac.compare_digest(supplied, expected))
 
-def password_hash(password, salt):
-    return hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1)
-
-def issue_session(db, ip):
-    token=secrets.token_urlsafe(32)
-    expires=(now()+timedelta(days=30)).isoformat()
-    db.execute('INSERT INTO sessions(token_hash,ip,expires) VALUES (?,?,?)',
-               (hashlib.sha256(token.encode()).hexdigest(),ip,expires))
-    return {'ok':True,'token':token,'expires':expires}
-
-def valid_session(db, token):
-    if not token: return False
-    row=db.execute('SELECT expires FROM sessions WHERE token_hash=?',
-                   (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
-    return bool(row and row[0]>now().isoformat())
-
-def snapshot(db):
+def snapshot(db, ip):
     spent = {row[0] for row in db.execute('SELECT id FROM spent')}
     used_row = db.execute('SELECT count FROM attempts WHERE day=?', (day_key(),)).fetchone()
     used = used_row[0] if used_row else 0
+    visitor_row=db.execute('SELECT count FROM visitor_attempts WHERE day=? AND ip=?',(day_key(),ip)).fetchone()
+    visitor_used=visitor_row[0] if visitor_row else 0
     cards = [{'id':x['id'],'rate':x['rate'],'kind':x['kind'],'preview':'/previews/'+x['preview'],
               'locked':x['id'] in spent} for x in catalog()]
-    return {'cards':cards,'usedToday':used,'remainingToday':max(0,LIMIT-used),'open':open_hours(),
+    return {'cards':cards,'usedToday':used,'remainingToday':max(0,LIMIT-used),
+            'usedVisitor':visitor_used,'remainingVisitor':max(0,VISITOR_LIMIT-visitor_used),'open':open_hours(),
             'spentCount':len(spent),'total':len(cards)}
 
 def log(ip, method, path, agent, outcome):
@@ -103,8 +95,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path; ip = self.ip(); agent = self.headers.get('User-Agent','')
         if path == '/api/status':
             with db_open() as db:
-                response = snapshot(db)
-                response['authenticated'] = valid_session(db,self.headers.get('X-Viewer-Token',''))
+                response = snapshot(db,ip)
             self.json(200,response); log(ip,'GET',path,agent,'status'); return
         if path == '/api/admin/log':
             if not check_password(self.headers.get('X-Admin-Key',''),ADMIN_FILE):
@@ -126,54 +117,21 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path; ip = self.ip(); agent = self.headers.get('User-Agent','')
         try: body = self.get_body()
         except (ValueError,json.JSONDecodeError): self.json(400,{'error':'request'}); return
-        if path == '/api/logout':
-            token=self.headers.get('X-Viewer-Token','')
-            if token:
-                with db_open() as db:
-                    db.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),))
-            self.json(200,{'ok':True}); log(ip,'POST',path,agent,'logout'); return
-        if path in ('/api/login','/api/register'):
-            password = str(body.get('password',''))
-            name = str(body.get('name','')).strip().casefold()
-            with db_open() as db:
-                db.execute('BEGIN IMMEDIATE')
-                db.execute('DELETE FROM failures WHERE at<?',((now()-timedelta(hours=1)).isoformat(),))
-                failures = db.execute('SELECT count(*) FROM failures WHERE ip=?',(ip,)).fetchone()[0]
-                if failures >= 5:
-                    db.commit(); self.json(429,{'error':'too_many_password_attempts'}); log(ip,'POST',path,agent,'blocked'); return
-                if path == '/api/register':
-                    if not re.fullmatch(r'[\w.-]{3,32}',name,flags=re.UNICODE) or len(password)<8 or len(password)>128 or password=='h':
-                        db.commit(); self.json(400,{'error':'invalid_credentials'}); return
-                    if db.execute('SELECT 1 FROM viewers WHERE name=?',(name,)).fetchone():
-                        db.commit(); self.json(409,{'error':'name_taken'}); return
-                    salt=os.urandom(16)
-                    db.execute('INSERT INTO viewers(name,salt,password_hash,created_at) VALUES (?,?,?,?)',
-                               (name,salt,password_hash(password,salt),now().isoformat()))
-                elif not (hmac.compare_digest(password,SPECIAL_VIEW_PASSWORD) and not name):
-                    row=db.execute('SELECT salt,password_hash FROM viewers WHERE name=?',(name,)).fetchone()
-                    dummy=b'\0'*16
-                    actual=password_hash(password,row[0] if row else dummy)
-                    if not row or not hmac.compare_digest(actual,row[1]):
-                        db.execute('INSERT INTO failures(ip,at) VALUES (?,?)',(ip,now().isoformat()))
-                        db.commit(); self.json(403,{'error':'password'}); log(ip,'POST',path,agent,'bad_password'); return
-                result=issue_session(db,ip)
-                db.commit()
-            self.json(200,result); log(ip,'POST',path,agent,'register' if path=='/api/register' else 'login'); return
         if path == '/api/open':
-            ident = str(body.get('id','')); token = self.headers.get('X-Viewer-Token','')
+            ident = str(body.get('id',''))
             with db_open() as db:
                 db.execute('BEGIN IMMEDIATE')
-                if not valid_session(db,token):
-                    db.commit(); self.json(401,{'error':'login_required'}); log(ip,'POST',path,agent,'login_required'); return
                 item = next((x for x in catalog() if x['id']==ident),None)
                 if not item:
                     db.commit(); self.json(404,{'error':'missing'}); return
                 if db.execute('SELECT 1 FROM spent WHERE id=?',(ident,)).fetchone():
                     db.commit(); self.json(410,{'error':'spent'}); log(ip,'POST',path,agent,'spent'); return
                 day = day_key(); used = db.execute('SELECT count FROM attempts WHERE day=?',(day,)).fetchone()
-                if not open_hours() or (used and used[0]>=LIMIT):
-                    db.commit(); self.json(423,{'error':'closed'}); log(ip,'POST',path,agent,'closed'); return
+                visitor_used=db.execute('SELECT count FROM visitor_attempts WHERE day=? AND ip=?',(day,ip)).fetchone()
+                if not open_hours() or (used and used[0]>=LIMIT) or (visitor_used and visitor_used[0]>=VISITOR_LIMIT):
+                    db.commit(); self.json(423,{'error':'limit'}); log(ip,'POST',path,agent,'limit'); return
                 db.execute('INSERT INTO attempts(day,count) VALUES (?,1) ON CONFLICT(day) DO UPDATE SET count=count+1',(day,))
+                db.execute('INSERT INTO visitor_attempts(day,ip,count) VALUES (?,?,1) ON CONFLICT(day,ip) DO UPDATE SET count=count+1',(day,ip))
                 if secrets.randbelow(100) >= item['rate']:
                     db.commit(); self.json(200,{'opened':False,'rate':item['rate']}); log(ip,'POST',path,agent,'miss'); return
                 payload = (VAULT/(ident+'.enc')).read_bytes()
@@ -187,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
             if not check_password(self.headers.get('X-Admin-Key',''),ADMIN_FILE):
                 self.json(403,{'error':'admin'}); log(ip,'POST',path,agent,'denied'); return
             with db_open() as db:
-                db.execute('BEGIN IMMEDIATE'); db.execute('DELETE FROM spent'); db.execute('DELETE FROM attempts'); db.execute('DELETE FROM failures'); db.commit()
+                db.execute('BEGIN IMMEDIATE'); db.execute('DELETE FROM spent'); db.execute('DELETE FROM attempts'); db.execute('DELETE FROM visitor_attempts'); db.commit()
             self.json(200,{'ok':True}); log(ip,'POST',path,agent,'reset'); return
         self.json(404,{'error':'not_found'}); log(ip,'POST',path,agent,'404')
 
